@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import time
 from functools import wraps
 from typing import Any, Callable, Optional, TypeVar, cast, overload
@@ -12,6 +13,8 @@ from freqtrade.mixins import LoggingMixin
 logger = logging.getLogger(__name__)
 __logging_mixin = None
 
+if os.name == 'nt':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 def _reset_logging_mixin():
     """
