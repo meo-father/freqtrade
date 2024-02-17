@@ -3,6 +3,7 @@
 # isort: skip_file
 # --- Do not remove these libs ---
 from datetime import datetime
+from typing import Optional
 
 import pandas as pd
 # --------------------------------
@@ -114,9 +115,10 @@ class MyAwesomeStrategy(IStrategy):
                 'ema12': {'color': 'blue'}
             },
             'subplots': {
-                # Subplots - each dict defines one additional plot
-                "RSI": {
-                    'rsi': {'color': 'red'},
+                "MACD": {
+                    'macd': {'color': 'blue', 'fill_to': 'macdhist'},
+                    'macdsignal': {'color': 'orange'},
+                    'macdhist': {'type': 'bar', 'plotly': {'opacity': 0.9}}
                 }
             }
         }
@@ -156,7 +158,10 @@ class MyAwesomeStrategy(IStrategy):
         dataframe['rsi'] = ta.RSI(dataframe)
 
         # MACD
-        macd = ta.MACD(dataframe)
+        #               fastperiod: 12
+        #             slowperiod: 26
+        #             signalperiod: 9
+        macd = ta.MACD(dataframe, fastperiod=288, slowperiod=388)
         dataframe['macd'] = macd['macd']
         dataframe['macdsignal'] = macd['macdsignal']
         dataframe['macdhist'] = macd['macdhist']
@@ -188,26 +193,14 @@ class MyAwesomeStrategy(IStrategy):
         dataframe['ema576'] = ta.EMA(dataframe, timeperiod=576)
         dataframe['ema676'] = ta.EMA(dataframe, timeperiod=676)
         dataframe['ema12'] = ta.EMA(dataframe, timeperiod=12)
-        dataframe.loc[qtpylib.crossed_above(dataframe["ema12"], dataframe["ema144"]), 'ema12x144'] = 1
+        dataframe.loc[qtpylib.crossed_below(dataframe["ema12"], dataframe["ema144"]), 'ema12x144'] = 1
 
-        # TEMA - Triple Exponential Moving Average
-        dataframe['tema'] = ta.TEMA(dataframe, timeperiod=9)
-
-        # Cycle Indicator
-        # ------------------------------------
-        # Hilbert Transform Indicator - SineWave
-        hilbert = ta.HT_SINE(dataframe)
-        dataframe['htsine'] = hilbert['sine']
-        dataframe['htleadsine'] = hilbert['leadsine']
-
-        """
-        # first check if dataprovider is available
-        if self.dp:
-            if self.dp.runmode.value in ('live', 'dry_run'):
-                ob = self.dp.orderbook(metadata['pair'], 1)
-                dataframe['best_bid'] = ob['bids'][0][0]
-                dataframe['best_ask'] = ob['asks'][0][0]
-        """
+        dataframe.loc[(
+                (qtpylib.crossed_above(dataframe["ema12"], dataframe["ema676"])) &
+                (dataframe["ema676"] > dataframe["ema169"]) &
+                (dataframe["ema676"] > dataframe["ema144"]) &
+                (dataframe["volume"] > 0)
+        ), 'breakthrough'] = 1
 
         return dataframe
 
@@ -218,37 +211,52 @@ class MyAwesomeStrategy(IStrategy):
         :param metadata: Additional information, like the currently traded pair
         :return: DataFrame with entry columns populated
         """
-        dont_buy_conditions = [(dataframe["ema676"] > dataframe["close"])]
         dataframe.loc[(
-                (dataframe["ema144"] > dataframe["ema576"]) &
-                (dataframe["ema144"] > dataframe["ema676"]) &
-                (dataframe["ema169"] > dataframe["ema576"]) &
-                (dataframe["ema169"] > dataframe["ema676"]) &
-                (dataframe["ema144"] < dataframe["bb_upperband"]) &
-                (dataframe["ema144"] > dataframe["bb_lowerband"]) &
-                (dataframe["close"] > dataframe["bb_middleband"]) &
-                (dataframe['rsi'] > 70) &
-                (dataframe["volume"] > 0)
-        ), ['enter_long', 'enter_tag']] = (1, "rsi 70 且 突破")
+            (qtpylib.crossed_above(dataframe["macdsignal"], 0))
+        ), ['enter_long', 'enter_tag']] = (1, "MACD")
 
         dataframe.loc[(
-                (dataframe["ema144"] > dataframe["ema576"]) &
-                (dataframe["ema144"] > dataframe["ema676"]) &
-                (dataframe["ema169"] > dataframe["ema576"]) &
-                (dataframe["ema169"] > dataframe["ema676"]) &
-                (qtpylib.crossed_above(dataframe["ema12"], dataframe["ema144"])) &
-                (dataframe["close"] > dataframe["bb_middleband"]) &
-                (dataframe['rsi'] > 55) &
-                (dataframe["volume"] > 0)
-        ), ['enter_long', 'enter_tag']] = (1, "12x144 金叉")
+            (qtpylib.crossed_above(dataframe["ema144"], dataframe["ema676"]))
+        ), ['enter_long', 'enter_tag']] = (1, "144X676")
 
-        if dont_buy_conditions:
-            for condition in dont_buy_conditions:
-                dataframe.loc[condition, 'enter_long'] = 0
+        dataframe.loc[(
+            (qtpylib.crossed_above(dataframe["ema12"], dataframe["ema144"]))
+        ), ['enter_long', 'enter_tag']] = (1, "12X144")
+
+        dataframe.loc[(), "wait_for_back"] = 0
+
         return dataframe
 
+    def confirm_trade_entry(self, pair: str, order_type: str, amount: float, rate: float,
+                            time_in_force: str, current_time: datetime, entry_tag: Optional[str],
+                            side: str, **kwargs) -> bool:
+
+        dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        last_candle = dataframe.iloc[-1].squeeze()
+        temp = dataframe.tail(50)
+
+        if entry_tag == '144X676' and last_candle["macdsignal"] > 0:
+            # 判断是否拉伸超过2% ，就需要等待回调
+            if (abs((rate - last_candle["ema676"]) / rate)) > 0.02:
+                dataframe.loc[(dataframe["date"] == last_candle['date']), "wait_for_back"] = 1
+                return False
+            return True
+
+        #if entry_tag == '12X144':
+        #    temp = dataframe.tail(200)
+        #    if len(temp[temp["wait_for_back"] == 1]) >= 1:
+        #        return True
+
+        if entry_tag == 'MACD' and last_candle["ema676"] < last_candle["ema144"]:
+            return True
+
+        if len(temp[temp["enter_tag"] == '144X676']) == 1 and len(temp[temp["enter_tag"] == 'MACD']) == 1:
+            return True
+
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        dataframe.loc[(), ['exit_long', 'exit_tag']] = (0, 'long_out')
+
+        dataframe.loc[(qtpylib.crossed_below(dataframe["ema144"], dataframe["ema676"])), ['exit_long', 'exit_tag']] = (
+            1, 'long_out')
         return dataframe
 
     def custom_stoploss(self, pair: str, trade: 'Trade', current_time: datetime,
@@ -257,23 +265,12 @@ class MyAwesomeStrategy(IStrategy):
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         last_candle = dataframe.iloc[-1].squeeze()
 
-        if last_candle['ema576'] > last_candle['ema144']:
+        if last_candle["exit_long"] == 1:
             return stoploss_from_absolute(last_candle["close"], current_rate, is_short=trade.is_short)
-
-        # 从 下单后第 10 个开始判断是否当前的 144 和 169 的均线 开始变小
-        if len(dataframe[dataframe["date"] > trade.open_date_utc]) > 200:
-            temp = dataframe[dataframe["date"] == trade.open_date_utc]
-            trade_k = temp.squeeze()
-            if len(temp) == 1:
-                if trade_k["ema144"] > last_candle["ema144"]:
-                    return stoploss_from_absolute(last_candle["close"], current_rate, is_short=trade.is_short)
-
-        # Use  parabolic  sar as absolute stoploss price
-        stoploss_price = last_candle['ema676'] + (last_candle['ema676'] * -0.05)
-
-        # Convert absolute price to percentage relative to current_rate
-        if stoploss_price < current_rate:
-            return stoploss_from_absolute(stoploss_price, current_rate, is_short=trade.is_short)
+        # 下单后 50 个K 线内 出现 ema12 死叉 ema144，立即止损
+        if len(dataframe[dataframe["date"] > trade.open_date_utc]) < 50:
+            if last_candle["ema12x144"] == 1:
+                return stoploss_from_absolute(last_candle["close"], current_rate, is_short=trade.is_short)
 
         # return maximum stoploss value, keeping current stoploss price unchanged
         return None
@@ -281,24 +278,19 @@ class MyAwesomeStrategy(IStrategy):
     def custom_exit(self, pair: str, trade: 'Trade', current_time: 'datetime', current_rate: float,
                     current_profit: float, **kwargs):
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
-        pd.set_option("display.max_columns", None)
         last_candle = dataframe.iloc[-1].squeeze()
 
-        # Above 20% profit, sell when rsi < 80
-        if current_profit > 0.2:
-            if last_candle['rsi'] < 80:
-                return 'rsi_below_80'
+        if 0 < current_profit < 0.01:
+            temp = dataframe[dataframe["date"] > trade.open_date_utc]
+            if len(temp[temp["ema12x144"] == 1]) > 5:
+                return "超过5次下穿 144 线 , 退出"
 
-        # 12 对 144 死叉 有盈利就可以先退出 等金叉后接回来
-        if current_profit > 0 and last_candle["ema12x144"] == 1:
-            return '12 对 144 死叉'
-
-        # Between 2% and 10%, sell if EMA-long above EMA-short
+        if 0.01 < current_profit < 0.02:
+            temp = dataframe[dataframe["date"] > trade.open_date_utc]
+            if len(temp[temp["ema12x144"] == 1]) > 3:
+                return "超过三次下穿 144 线 且 盈利 只有 1-2 %"
 
         if 0.02 < current_profit:
             if (last_candle["bb_lowerband"] < last_candle['ema169']
                     and last_candle["bb_middleband"] > last_candle['close']):
                 return "布林轨道下沿跌破 169"
-
-        if current_profit > 0.1:
-            return '10%收益'
