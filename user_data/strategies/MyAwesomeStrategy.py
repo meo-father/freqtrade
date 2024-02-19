@@ -73,8 +73,8 @@ class MyAwesomeStrategy(IStrategy):
     startup_candle_count: int = 30
 
     # Strategy parameters
-    buy_rsi = IntParameter(10, 40, default=20, space="buy")
-    sell_rsi = IntParameter(60, 90, default=80, space="sell")
+    buy_rsi = IntParameter(10, 40, default=35, space="buy")
+    sell_rsi = IntParameter(60, 90, default=75, space="sell")
 
     # Optional order type mapping.
     order_types = {
@@ -194,6 +194,7 @@ class MyAwesomeStrategy(IStrategy):
         dataframe['ema676'] = ta.EMA(dataframe, timeperiod=676)
         dataframe['ema12'] = ta.EMA(dataframe, timeperiod=12)
         dataframe.loc[qtpylib.crossed_below(dataframe["ema12"], dataframe["ema144"]), 'ema12x144'] = 1
+        dataframe.loc[qtpylib.crossed_below(dataframe["ema144"], dataframe["ema576"]), 'ema144x576'] = 1
 
         dataframe.loc[(
                 (qtpylib.crossed_above(dataframe["ema12"], dataframe["ema676"])) &
@@ -201,6 +202,14 @@ class MyAwesomeStrategy(IStrategy):
                 (dataframe["ema676"] > dataframe["ema144"]) &
                 (dataframe["volume"] > 0)
         ), 'breakthrough'] = 1
+
+        dataframe.loc[(
+            (qtpylib.crossed_above(dataframe["macdsignal"], 0))
+        ), 'macd_cross'] = 1
+
+        dataframe.loc[(
+            (qtpylib.crossed_above(dataframe["ema144"], dataframe["ema676"]))
+        ), 'ema576_cross'] = 1
 
         return dataframe
 
@@ -212,18 +221,12 @@ class MyAwesomeStrategy(IStrategy):
         :return: DataFrame with entry columns populated
         """
         dataframe.loc[(
-            (qtpylib.crossed_above(dataframe["macdsignal"], 0))
-        ), ['enter_long', 'enter_tag']] = (1, "MACD")
-
-        dataframe.loc[(
-            (qtpylib.crossed_above(dataframe["ema144"], dataframe["ema676"]))
-        ), ['enter_long', 'enter_tag']] = (1, "144X676")
-
-        dataframe.loc[(
-            (qtpylib.crossed_above(dataframe["ema12"], dataframe["ema144"]))
-        ), ['enter_long', 'enter_tag']] = (1, "12X144")
-
-        dataframe.loc[(), "wait_for_back"] = 0
+                (qtpylib.crossed_below(dataframe["rsi"], self.buy_rsi.value)) &
+                (dataframe["ema144"] > dataframe["ema676"]) &
+                (dataframe["ema169"] > dataframe["ema576"]) &
+                (dataframe["macd"] > 0) &
+                (dataframe["macdsignal"] > 0)
+        ), 'enter_long'] = 1
 
         return dataframe
 
@@ -233,30 +236,21 @@ class MyAwesomeStrategy(IStrategy):
 
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         last_candle = dataframe.iloc[-1].squeeze()
-        temp = dataframe.tail(50)
 
-        if entry_tag == '144X676' and last_candle["macdsignal"] > 0:
-            # 判断是否拉伸超过2% ，就需要等待回调
-            if (abs((rate - last_candle["ema676"]) / rate)) > 0.02:
-                dataframe.loc[(dataframe["date"] == last_candle['date']), "wait_for_back"] = 1
-                return False
-            return True
+        # 前面出现多个买入信号 且没买入， 意味着 提前退出了 就不再买入
+        temp = dataframe.tail(100)
+        if len(temp[temp["enter_long"] == 1]) > 3:
+            return False
 
-        #if entry_tag == '12X144':
-        #    temp = dataframe.tail(200)
-        #    if len(temp[temp["wait_for_back"] == 1]) >= 1:
-        #        return True
+        # 买入之前先确认是否在 macd 在 0 轴上方， 且 ema 144 在下方 ， ema 576 在下方
 
-        if entry_tag == 'MACD' and last_candle["ema676"] < last_candle["ema144"]:
-            return True
-
-        if len(temp[temp["enter_tag"] == '144X676']) == 1 and len(temp[temp["enter_tag"] == 'MACD']) == 1:
+        if last_candle["close"] > last_candle["ema576"] > last_candle["ema676"]:
             return True
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
 
-        dataframe.loc[(qtpylib.crossed_below(dataframe["ema144"], dataframe["ema676"])), ['exit_long', 'exit_tag']] = (
-            1, 'long_out')
+        dataframe.loc[(qtpylib.crossed_above(dataframe["rsi"], self.sell_rsi.value)), ['exit_long', 'exit_tag']] = (
+            1, 'rsi 80')
         return dataframe
 
     def custom_stoploss(self, pair: str, trade: 'Trade', current_time: datetime,
@@ -265,11 +259,15 @@ class MyAwesomeStrategy(IStrategy):
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         last_candle = dataframe.iloc[-1].squeeze()
 
-        if last_candle["exit_long"] == 1:
+        if last_candle["ema144x576"] == 1:
             return stoploss_from_absolute(last_candle["close"], current_rate, is_short=trade.is_short)
-        # 下单后 50 个K 线内 出现 ema12 死叉 ema144，立即止损
-        if len(dataframe[dataframe["date"] > trade.open_date_utc]) < 50:
-            if last_candle["ema12x144"] == 1:
+
+        # 买入后出现多个买入信号,且最后一个（当前这个 last_candle 就是最后一个） 更小
+        temp = dataframe[dataframe["date"] > trade.open_date_utc]
+        if len(temp[temp["enter_long"] == 1]) > 2:
+            trade_k = dataframe[dataframe["date"] == trade.open_date_utc]
+            trade_k_value = trade_k.squeeze()
+            if len(trade_k) == 1 and last_candle["enter_long"] == 1 and last_candle["rsi"] < trade_k_value["rsi"]:
                 return stoploss_from_absolute(last_candle["close"], current_rate, is_short=trade.is_short)
 
         # return maximum stoploss value, keeping current stoploss price unchanged
@@ -280,17 +278,7 @@ class MyAwesomeStrategy(IStrategy):
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         last_candle = dataframe.iloc[-1].squeeze()
 
-        if 0 < current_profit < 0.01:
-            temp = dataframe[dataframe["date"] > trade.open_date_utc]
-            if len(temp[temp["ema12x144"] == 1]) > 5:
-                return "超过5次下穿 144 线 , 退出"
-
-        if 0.01 < current_profit < 0.02:
-            temp = dataframe[dataframe["date"] > trade.open_date_utc]
-            if len(temp[temp["ema12x144"] == 1]) > 3:
-                return "超过三次下穿 144 线 且 盈利 只有 1-2 %"
-
         if 0.02 < current_profit:
             if (last_candle["bb_lowerband"] < last_candle['ema169']
-                    and last_candle["bb_middleband"] > last_candle['close']):
+                    and last_candle["bb_middleband"] < last_candle['close'] and last_candle["rsi"] > 40):
                 return "布林轨道下沿跌破 169"
